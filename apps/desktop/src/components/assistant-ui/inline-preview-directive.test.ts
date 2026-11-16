@@ -9,9 +9,18 @@ import {
   intentAckMessage,
   intentScript,
   MAX_INTENT_LENGTH,
+  popoutPreviewUrl,
   themePrelude,
   withInlineChrome
 } from './inline-preview-directive'
+
+describe('popoutPreviewUrl', () => {
+  it('keeps the mount token in a same-origin dedicated preview shell URL', () => {
+    expect(popoutPreviewUrl('https://brew.example', 'a token/with?marks')).toBe(
+      'https://brew.example/preview-popout.html#a%20token%2Fwith%3Fmarks'
+    )
+  })
+})
 
 describe('directiveFrameHeight', () => {
   it('returns null (auto-size) when absent or garbage', () => {
@@ -31,12 +40,25 @@ describe('directiveFrameHeight', () => {
 describe('withInlineChrome', () => {
   const prelude = themePrelude({ '--foreground': '#eee' }, 'Inter', 'dark')
 
-  it('puts the theme prelude FIRST so page styles override it', () => {
+  it('puts the theme prelude FIRST in <head> so page styles override it', () => {
     const doc = '<html><head><style>body{color:red}</style></head><body><h1>hi</h1></body></html>'
     const framed = withInlineChrome(doc, 'tok', prelude)
 
-    expect(framed.startsWith(prelude)).toBe(true)
+    expect(framed.startsWith('<html><head>' + prelude)).toBe(true)
     expect(framed.indexOf(prelude)).toBeLessThan(framed.indexOf('color:red'))
+  })
+
+  // Local patch (memo autosave in web Hermes): nothing may precede <!doctype>.
+  it('keeps a full page in standards mode (prelude after the doctype)', () => {
+    const doc = '<!doctype html><html lang="en"><head><title>t</title></head><body>x</body></html>'
+    const framed = withInlineChrome(doc, 'tok', prelude)
+
+    expect(framed.startsWith('<!doctype html>')).toBe(true)
+    expect(framed.indexOf(prelude)).toBeLessThan(framed.indexOf('<title>'))
+  })
+
+  it('still prepends the prelude to a bare fragment', () => {
+    expect(withInlineChrome('<h1>f</h1>', 'tok', prelude).startsWith(prelude)).toBe(true)
   })
 
   it('injects the measuring script before </body>', () => {

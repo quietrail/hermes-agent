@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { requestComposerSubmit } from '@/app/chat/composer/focus'
 import { useSessionView } from '@/app/chat/session-view'
@@ -7,7 +7,10 @@ import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { PreviewDocumentFrame } from '@/components/ui/preview-document-frame'
 import { useThemeEpoch } from '@/hooks/use-theme-epoch'
 import { isReadFileErrorResult, readDesktopFileText } from '@/lib/desktop-fs'
-import { localPreviewTarget } from '@/lib/local-preview'
+import { ChevronDown, ChevronRight, ExternalLink, MonitorPlay } from '@/lib/icons'
+import { localPreviewTarget, normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { injectAtHead, loadPreviewStore, persistStorageMessage, storageShimScript } from '@/lib/preview-storage-bridge'
+import { $visiblePreviewTabs, closePreviewForSource, openPreview } from '@/store/preview'
 
 /**
  * `::preview{file="…"}` — a workspace HTML file rendered LIVE inside the
@@ -284,6 +287,13 @@ export function measurementScript(token: string): string {
   )
 }
 
+const POP_OUT_READY_TYPE = 'hermes-preview-popout-ready'
+const POP_OUT_INIT_TYPE = 'hermes-preview-popout-init'
+
+export function popoutPreviewUrl(origin: string, token: string): string {
+  return new URL(`/preview-popout.html#${encodeURIComponent(token)}`, origin).toString()
+}
+
 /** Assemble the srcdoc: theme prelude first (so the page's own styles win),
  *  then the measuring + intent scripts before `</body>` when present so they
  *  run after the page's own markup, appended otherwise. */
@@ -292,7 +302,60 @@ export function withInlineChrome(doc: string, token: string, prelude: string): s
   const bodyClose = /<\/body\s*>/i.exec(doc)
   const framed = bodyClose ? doc.slice(0, bodyClose.index) + script + doc.slice(bodyClose.index) : doc + script
 
-  return prelude + framed
+  // Local patch (memo autosave in web Hermes): the prelude goes inside <head>
+  // (after any doctype) so a full page keeps standards mode; still ahead of
+  // the page's own styles and scripts.
+  return injectAtHead(framed, prelude)
+}
+
+/** Inline preview view modes:
+ *  how a tall inline document sits in the transcript. `fit` = its full
+ *  height (upstream behaviour), `compact` = a short scrollable window, so the
+ *  messages above and below stay on screen, `collapsed` = the header only. */
+export type InlineViewMode = 'collapsed' | 'compact' | 'fit'
+const VIEW_PREFIX = 'hermes:preview-view:v1:'
+/** Documents at least this tall get the header bar and start compact. */
+export const VIEW_BAR_MIN_HEIGHT = 360
+const COMPACT_DEFAULT_ABOVE = 560
+
+function storedViewMode(path: string | null): InlineViewMode | null {
+  try {
+    const value = path ? window.localStorage.getItem(VIEW_PREFIX + path) : null
+
+    return value === 'collapsed' || value === 'compact' || value === 'fit' ? value : null
+  } catch {
+    return null
+  }
+}
+
+function storeViewMode(path: string | null, mode: InlineViewMode) {
+  try {
+    if (path) {
+      window.localStorage.setItem(VIEW_PREFIX + path, mode)
+    }
+  } catch {
+    // Storage full or blocked: the choice lasts for this page view only.
+  }
+}
+
+/** The compact window: half the viewport, never under 320 px, never taller
+ *  than the document itself. */
+export function compactHeight(measured: number, viewport: number): number {
+  return Math.min(measured, Math.max(320, Math.round(viewport * 0.5)))
+}
+
+function documentTitle(doc: string | null): string {
+  const match = doc ? /<title[^>]*>([^<]*)<\/title>/i.exec(doc) : null
+  const text = match?.[1]?.replace(/\s+/g, ' ').trim() ?? ''
+
+  if (!text || typeof document === 'undefined') {
+    return text
+  }
+
+  const decoder = document.createElement('textarea')
+  decoder.innerHTML = text
+
+  return decoder.value
 }
 
 export interface FrameSizeReport {
@@ -416,6 +479,11 @@ function InlineHtmlFrame({
     let lastIntentAt = 0
 
     const onMessage = (event: MessageEvent) => {
+      // Local patch (memo autosave in web Hermes): the frame's own store.
+      if (persistStorageMessage(event.data, token, path)) {
+        return
+      }
+
       const decision = evaluateIntent(event.data, token, Date.now(), lastIntentAt)
 
       if (decision !== null) {
@@ -465,9 +533,39 @@ function InlineHtmlFrame({
     window.addEventListener('message', onMessage)
 
     return () => window.removeEventListener('message', onMessage)
-  }, [initialHeight, token])
+  }, [initialHeight, path, token])
 
   const { vars, font, colorScheme } = bridge
+  // One live copy per file: a memo re-saves its whole state on a timer, so a
+  // copy here and a copy in the pane would overwrite each other's answers.
+  // While the file is open in the pane, this copy steps aside.
+  const paneTabs = useStore($visiblePreviewTabs)
+
+  const paneTab = paneTabs.find(
+    tab => tab.target.kind === 'file' && (tab.target.source === file || (path !== null && tab.target.path === path))
+  )
+
+  const inPane = Boolean(paneTab)
+  const [popupWindow, setPopupWindow] = useState<Window | null>(null)
+  const inPopout = Boolean(popupWindow)
+  const elsewhere = inPane || inPopout
+  const [storeSnapshot, setStoreSnapshot] = useState(() => loadPreviewStore(path))
+
+  useEffect(() => {
+    if (!popupWindow) {return}
+
+    const checkClosed = window.setInterval(() => {
+      if (popupWindow.closed) {
+        window.clearInterval(checkClosed)
+        setStoreSnapshot(loadPreviewStore(path))
+        setPopupWindow(null)
+      }
+    }, 500)
+
+    return () => window.clearInterval(checkClosed)
+  }, [path, popupWindow])
+
+  useEffect(() => setStoreSnapshot(loadPreviewStore(path)), [path])
 
   // Rebuild the srcdoc when the bridge changes (a repaint or a skin swap,
   // whichever changed a token or the scheme) so its native controls and
@@ -477,24 +575,215 @@ function InlineHtmlFrame({
       return null
     }
 
-    return withInlineChrome(doc, token, themePrelude(vars, font, colorScheme))
-  }, [vars, font, colorScheme, doc, token])
+    // The store snapshot is read when the document is (re)built; later
+    // writes flow up through the bridge without rebuilding the frame.
+    return withInlineChrome(doc, token, themePrelude(vars, font, colorScheme) + storageShimScript(token, storeSnapshot))
+  }, [vars, font, colorScheme, doc, token, storeSnapshot])
+
+  const [viewChoice, setViewChoice] = useState<InlineViewMode | null>(() => storedViewMode(path))
+  const [viewport, setViewport] = useState(() => (typeof window === 'undefined' ? 900 : window.innerHeight))
+  const title = useMemo(() => documentTitle(doc), [doc])
+
+  useEffect(() => setViewChoice(storedViewMode(path)), [path])
+
+  useEffect(() => {
+    const onResize = () => setViewport(window.innerHeight)
+    window.addEventListener('resize', onResize)
+
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  const chooseView = useCallback(
+    (mode: InlineViewMode) => {
+      setViewChoice(mode)
+      storeViewMode(path, mode)
+    },
+    [path]
+  )
+
+  const openInPane = useCallback(() => {
+    void normalizeOrLocalPreviewTarget(file, cwd || undefined).then(preview => preview && openPreview(preview))
+  }, [cwd, file])
+
+  const popOut = useCallback(() => {
+    if (doc === null || !path || !/^https?:$/.test(window.location.protocol)) {return}
+
+    const head = themePrelude(vars, font, colorScheme)
+    let popup: Window | null = null
+
+    const onReady = (event: MessageEvent) => {
+      const data = event.data as { token?: unknown; type?: unknown } | null
+
+      if (
+        event.source !== popup ||
+        event.origin !== window.location.origin ||
+        data?.type !== POP_OUT_READY_TYPE ||
+        data.token !== token
+      ) {
+        return
+      }
+
+      popup?.postMessage(
+        {
+          head,
+          html: doc,
+          path,
+          title: title || file.split('/').pop() || 'Hermes preview',
+          token,
+          type: POP_OUT_INIT_TYPE
+        },
+        window.location.origin
+      )
+      window.removeEventListener('message', onReady)
+    }
+
+    window.addEventListener('message', onReady)
+    popup = window.open(popoutPreviewUrl(window.location.origin, token), '_blank')
+
+    if (!popup) {
+      window.removeEventListener('message', onReady)
+
+      return
+    }
+
+    setPopupWindow(popup)
+    window.setTimeout(() => window.removeEventListener('message', onReady), 10_000)
+  }, [colorScheme, doc, file, font, path, title, token, vars])
+
+  const showHere = useCallback(() => {
+    // Capture synchronously before closing: otherwise the memo's old inline
+    // snapshot can mount and overwrite the answer just made elsewhere.
+    setStoreSnapshot(loadPreviewStore(path))
+
+    if (paneTab) {
+      closePreviewForSource(paneTab.target.source)
+    }
+
+    if (popupWindow) {
+      popupWindow.close()
+      setPopupWindow(null)
+    }
+  }, [paneTab, path, popupWindow])
 
   if (!path || failed) {
     return <PreviewAttachment target={file} />
   }
 
-  const height = measured ?? initialHeight ?? DEFAULT_HEIGHT
+  const fullHeight = measured ?? initialHeight ?? DEFAULT_HEIGHT
+  const showBar = elsewhere || viewChoice !== null || (measured ?? 0) >= VIEW_BAR_MIN_HEIGHT
+
+  const view: InlineViewMode = elsewhere
+    ? 'collapsed'
+    : (viewChoice ?? ((measured ?? 0) > COMPACT_DEFAULT_ABOVE ? 'compact' : 'fit'))
+
+  const height = view === 'compact' ? compactHeight(fullHeight, viewport) : fullHeight
+
+  const barButton =
+    'flex shrink-0 items-center gap-1 rounded-md border border-(--ui-stroke-tertiary) bg-background/40 px-2 py-0.5 text-[0.7rem] font-medium text-muted-foreground transition-colors hover:bg-accent/55 hover:text-foreground'
 
   return (
-    <span className="my-2 block w-full" style={{ maxWidth: MAX_FRAME_WIDTH }}>
-      {framedDoc === null ? (
+    <span
+      className="my-2 block w-full"
+      data-hermes-inline-view={showBar ? view : undefined}
+      style={{ maxWidth: MAX_FRAME_WIDTH }}
+    >
+      {showBar && framedDoc !== null && (
+        <span
+          className={
+            'flex w-full items-center gap-1.5 border border-(--ui-stroke-tertiary) bg-card/55 px-2 py-1 text-sm ' +
+            (view === 'collapsed' ? 'rounded-lg' : 'rounded-t-lg border-b-0')
+          }
+        >
+          <button
+            aria-expanded={view !== 'collapsed'}
+            aria-label={elsewhere ? 'Click to show it here instead' : view === 'collapsed' ? 'Expand' : 'Collapse'}
+            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+            data-hermes-inline-toggle=""
+            onClick={() => (elsewhere ? showHere() : chooseView(view === 'collapsed' ? 'compact' : 'collapsed'))}
+            type="button"
+          >
+            {view === 'collapsed' ? (
+              <ChevronRight className="size-3.5 shrink-0" />
+            ) : (
+              <ChevronDown className="size-3.5 shrink-0" />
+            )}
+            <span className="min-w-0 truncate text-[0.78rem] font-medium text-foreground/90">
+              {title || file.split('/').pop()}
+            </span>
+            <span className="shrink-0 text-[0.68rem] text-muted-foreground">
+              {elsewhere ? 'Show here' : view === 'collapsed' ? 'Expand' : 'Collapse'}
+            </span>
+          </button>
+          {elsewhere && (
+            <span className="shrink-0 text-[0.7rem] text-muted-foreground" data-hermes-inline-elsewhere="">
+              {inPopout ? 'Open in its own tab' : 'Open in the pane'}
+            </span>
+          )}
+          {view !== 'collapsed' && fullHeight > compactHeight(fullHeight, viewport) && (
+            <button
+              aria-label={view === 'compact' ? 'Show the whole document in the chat' : 'Shrink to a scrollable window'}
+              className={barButton}
+              data-hermes-inline-size=""
+              onClick={() => chooseView(view === 'compact' ? 'fit' : 'compact')}
+              type="button"
+            >
+              {view === 'compact' ? 'Full height' : 'Compact'}
+            </button>
+          )}
+          {elsewhere ? (
+            <button
+              aria-label="Close the other copy and show it here"
+              className={barButton}
+              data-hermes-inline-here=""
+              onClick={showHere}
+              type="button"
+            >
+              Show here
+            </button>
+          ) : (
+            <>
+              <button
+                aria-label="Open beside the chat"
+                className={barButton}
+                data-hermes-inline-pane=""
+                onClick={openInPane}
+                type="button"
+              >
+                <MonitorPlay className="size-3" />
+                Pane
+              </button>
+              {/^https?:$/.test(window.location.protocol) && (
+                <button
+                  aria-label="Open in its own browser tab"
+                  className={barButton}
+                  data-hermes-inline-popout=""
+                  onClick={popOut}
+                  type="button"
+                >
+                  <ExternalLink className="size-3" />
+                  New tab
+                </button>
+              )}
+            </>
+          )}
+        </span>
+      )}
+      {elsewhere ? null : framedDoc === null ? (
         <span
           className="block w-full animate-pulse rounded-md bg-[color-mix(in_srgb,currentColor_4%,transparent)]"
           style={{ height }}
         />
       ) : (
-        <span className="relative block w-full transition-[height] duration-200" style={{ height }}>
+        <span
+          className={
+            'relative block w-full transition-[height] duration-200' +
+            (showBar && view !== 'collapsed'
+              ? ' overflow-hidden rounded-b-lg border border-t-0 border-(--ui-stroke-tertiary)'
+              : '')
+          }
+          // Collapsed keeps the frame mounted (0 px) so its state and store survive.
+          style={{ height: view === 'collapsed' && showBar ? 0 : height }}
+        >
           <PreviewDocumentFrame
             className="absolute inset-0 size-full border-0 bg-transparent"
             loading="lazy"

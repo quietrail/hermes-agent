@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Preview unavailable</title>
+    <style>
+      html,
+      body,
+      iframe {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        border: 0;
+        background: transparent;
+      }
+      body {
+        overflow: hidden;
+      }
+      #status {
+        padding: 1rem;
+        font: 14px system-ui;
+        color: #666;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status">Opening preview…</div>
+    <script>
+      ;(() => {
+        const STORAGE_TYPE = 'hermes-inline-preview-storage'
+        const READY_TYPE = 'hermes-preview-popout-ready'
+        const INIT_TYPE = 'hermes-preview-popout-init'
+        const PREFIX = 'hermes:preview-storage:v1:'
+        const SESSION_KEY = 'hermes:preview-popout:v1'
+        const MAX_FILE = 1000000
+        const MAX_TOTAL = 2000000
+        const token = decodeURIComponent(location.hash.slice(1))
+        let path = ''
+        let frame = null
+
+        function otherStoresChars(except) {
+          let total = 0
+          for (let index = 0; index < localStorage.length; index += 1) {
+            const key = localStorage.key(index)
+            if (key && key !== except && key.startsWith(PREFIX))
+              total += key.length + (localStorage.getItem(key) || '').length
+          }
+          return total
+        }
+
+        function validStore(value) {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+          return Object.values(value).every(item => typeof item === 'string')
+        }
+
+        function safeJson(value) {
+          return JSON.stringify(value)
+            .replace(/</g, '\\u003c')
+            .replace(/\u2028/g, '\\u2028')
+            .replace(/\u2029/g, '\\u2029')
+        }
+
+        function injectAtHead(doc, head) {
+          const lead =
+            /^(?:\s|<!--[\s\S]*?-->)*(?:<!doctype[^>]*>)?(?:\s|<!--[\s\S]*?-->)*(?:<html\b[^>]*>)?(?:\s|<!--[\s\S]*?-->)*(?:<head\b[^>]*>)?/i.exec(
+              doc
+            )
+          const at = lead ? lead[0].length : 0
+          return doc.slice(0, at) + head + doc.slice(at)
+        }
+
+        function storageShim(snapshot) {
+          return (
+            '<script>(function(){var t=' +
+            safeJson(token) +
+            ',d=' +
+            safeJson(snapshot) +
+            ',q=false,o=Object.prototype.hasOwnProperty;' +
+            'function flush(){q=false;try{parent.postMessage({type:' +
+            safeJson(STORAGE_TYPE) +
+            ',token:t,data:d},"*")}catch(e){}}' +
+            'function save(){if(!q){q=true;Promise.resolve().then(flush)}}' +
+            'function mk(m,p){return{getItem:function(k){k=String(k);return o.call(m,k)?m[k]:null},' +
+            'setItem:function(k,v){m[String(k)]=String(v);if(p)save()},removeItem:function(k){delete m[String(k)];if(p)save()},' +
+            'clear:function(){for(var k in m)delete m[k];if(p)save()},key:function(i){var k=Object.keys(m);return i<k.length?k[i]:null},' +
+            'get length(){return Object.keys(m).length}}}' +
+            'var ls=mk(d,true),ss=mk({},false);' +
+            'try{Object.defineProperty(window,"localStorage",{configurable:true,get:function(){return ls}})}catch(e){}' +
+            'try{Object.defineProperty(window,"sessionStorage",{configurable:true,get:function(){return ss}})}catch(e){}' +
+            'window.hermesPreviewStorage={persistent:true,flush:flush};addEventListener("pagehide",flush)})()<\/script>'
+          )
+        }
+
+        function loadStore() {
+          try {
+            const parsed = JSON.parse(localStorage.getItem(PREFIX + path) || '{}')
+            return validStore(parsed) ? parsed : {}
+          } catch {
+            return {}
+          }
+        }
+
+        function mount(data) {
+          if (
+            !data ||
+            data.token !== token ||
+            typeof data.path !== 'string' ||
+            !data.path ||
+            typeof data.html !== 'string'
+          )
+            return
+          path = data.path
+          document.title = typeof data.title === 'string' && data.title ? data.title : 'Hermes preview'
+          document.getElementById('status')?.remove()
+          frame?.remove()
+          frame = document.createElement('iframe')
+          frame.sandbox = 'allow-scripts'
+          frame.referrerPolicy = 'no-referrer'
+          frame.srcdoc = injectAtHead(data.html, String(data.head || '') + storageShim(loadStore()))
+          document.body.appendChild(frame)
+        }
+
+        addEventListener('message', event => {
+          const data = event.data
+          if (data && data.type === INIT_TYPE) {
+            if (event.source !== opener || event.origin !== location.origin || data.token !== token) return
+            const saved = { head: data.head, html: data.html, path: data.path, title: data.title, token: data.token }
+            try {
+              sessionStorage.setItem(SESSION_KEY, JSON.stringify(saved))
+            } catch {}
+            mount(saved)
+            return
+          }
+
+          if (
+            !frame ||
+            event.source !== frame.contentWindow ||
+            !data ||
+            data.type !== STORAGE_TYPE ||
+            data.token !== token ||
+            !validStore(data.data)
+          )
+            return
+          const json = JSON.stringify(data.data)
+          const key = PREFIX + path
+          if (json.length > MAX_FILE || otherStoresChars(key) + json.length > MAX_TOTAL) return
+          try {
+            if (Object.keys(data.data).length === 0) localStorage.removeItem(key)
+            else localStorage.setItem(key, json)
+          } catch {}
+        })
+
+        let saved = null
+        try {
+          saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null')
+        } catch {}
+        if (saved && saved.token === token) mount(saved)
+        else if (token && opener) opener.postMessage({ type: READY_TYPE, token }, location.origin)
+        else document.getElementById('status').textContent = 'This preview must be opened from Hermes.'
+      })()
+    </script>
+  </body>
+</html>

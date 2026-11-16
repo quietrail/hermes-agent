@@ -4,18 +4,17 @@ import './preview-mind'
 
 import { useStore } from '@nanostores/react'
 import type { ComponentProps, PointerEvent as ReactPointerEvent } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { requestComposerAttachImages, requestComposerFocus, requestComposerInsert } from '@/app/chat/composer/focus'
 import { openGuestContextMenu } from '@/app/context-menu/store'
 import { PanelEmpty } from '@/app/overlays/panel'
-import { PreviewDocumentFrame } from '@/components/ui/preview-document-frame'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode, isReadFileErrorResult } from '@/lib/desktop-fs'
 import { guardGuestPointers } from '@/lib/guest-pointer-guard'
 import { hostHas } from '@/lib/host-capabilities'
-import { isLoopbackPreviewUrl, openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
+import { isLoopbackPreviewUrl, openPreviewTargetInBrowser } from '@/lib/local-preview'
 import { isRemoteGateway } from '@/lib/media'
 import {
   addAnnotatePin,
@@ -78,6 +77,7 @@ import { runPreviewGuestScript, usePreviewDriveChannels, withPreviewDeadline } f
 import { LocalFilePreview, PreviewEmptyState, PreviewModeSwitcher } from './preview-file'
 import { usePreviewGuestOffscreen } from './preview-guest-offscreen'
 import { type PreviewInputEvent } from './preview-input'
+import { LiveHtmlPaneFrame } from './preview-live-html'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
 import { watchPreviewDocumentLifecycle } from './preview-script-runner'
@@ -397,10 +397,6 @@ export function PreviewPane({
   const usesBrowserIframe = webSurface === 'iframe'
   const usesWebview = webSurface === 'webview'
 
-  const remoteHtmlDocument = useMemo(
-    () => (isRemoteHtml ? remoteHtmlPreviewDocument(target.dataUrl!) : null),
-    [isRemoteHtml, target.dataUrl]
-  )
 
   const currentLabel = compactUrl(currentUrl)
 
@@ -858,6 +854,7 @@ export function PreviewPane({
     }
 
     const lifetime = new AbortController()
+
     const unregister = registerPreviewPageReader(tabId, async () => {
       const webview = webviewRef.current
 
@@ -1401,7 +1398,7 @@ export function PreviewPane({
   // rebuild it. Per-page state (annotate pins, console log, history) resets
   // around the load so nothing bleeds across pages. Skipped when the guest
   // already shows the address (an in-page navigation got there first).
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+
   useEffect(() => {
     if (!isWebPreview || isRemoteHtml) {
       return
@@ -1539,11 +1536,11 @@ export function PreviewPane({
             ref={hostRef}
           />
           {isRemoteHtml && (
-            <PreviewDocumentFrame
-              className="absolute inset-0 size-full border-0 bg-white"
-              referrerPolicy="no-referrer"
-              sandbox=""
-              srcDoc={remoteHtmlDocument || ''}
+            // Local patch (memo autosave in web Hermes): live, like Desktop's webview.
+            <LiveHtmlPaneFrame
+              dataUrl={target.dataUrl}
+              path={target.kind === 'file' ? target.path || null : null}
+              reloadKey={localReloadKey}
               title={target.label || copy.fallbackTitle}
             />
           )}

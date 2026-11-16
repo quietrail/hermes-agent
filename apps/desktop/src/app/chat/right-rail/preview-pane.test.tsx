@@ -760,8 +760,12 @@ describe('PreviewPane console state', () => {
     expect(reloadIgnoringCache).toHaveBeenCalledOnce()
   })
 
-  it('renders authenticated remote HTML safely and honors source mode', async () => {
-    const dataUrl = `data:text/html;base64,${btoa('<h1>remote</h1>')}`
+  // Browser-served remote HTML
+  // runs live, like Desktop's webview, in the opaque allow-scripts sandbox the inline frame uses,
+  // with a per-file storage bridge instead of a sanitized, script-free copy.
+  it('renders authenticated remote HTML live in an opaque sandbox and honors source mode', async () => {
+    window.localStorage.setItem('hermes:preview-storage:v1:/srv/report.html', JSON.stringify({ k: 'saved' }))
+    const dataUrl = `data:text/html;base64,${btoa('<html><head></head><body><h1>remote</h1><script>1</script></body></html>')}`
 
     const target = {
       dataUrl,
@@ -781,11 +785,13 @@ describe('PreviewPane console state', () => {
     const iframe = rendered.container.querySelector('iframe')
 
     expect(rendered.container.querySelector('webview')).toBeNull()
-    expect(iframe?.getAttribute('sandbox')).toBe('')
+    expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts')
     expect(iframe?.getAttribute('referrerpolicy')).toBe('no-referrer')
-    expect(iframe?.getAttribute('srcdoc')).toContain(`default-src 'none'`)
-    expect(iframe?.getAttribute('srcdoc')).toContain('<h1>remote</h1>')
+    expect(iframe?.getAttribute('srcdoc')).toContain('<h1>remote</h1><script>1</script>')
+    // The page's own store arrives in <head>, before its scripts.
+    expect(iframe?.getAttribute('srcdoc')).toMatch(/<head><script>.*"saved".*<\/script><\/head>/)
     expect(rendered.container.textContent).not.toContain(dataUrl)
+    window.localStorage.clear()
 
     await act(async () => {
       rendered.rerender(
@@ -830,6 +836,7 @@ describe('PreviewPane console state', () => {
   // A browser tab's back button belongs to the tab: the pane leaves it alone.
   it('leaves the mouse back button to the browser tab in browser-hosted Desktop', async () => {
     globalThis.document.documentElement.dataset.hermesDesktopHost = 'browser'
+
     const target = {
       kind: 'url' as const,
       label: 'Example',
